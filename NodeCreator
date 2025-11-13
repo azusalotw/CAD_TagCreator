@@ -1,0 +1,1607 @@
+Option Explicit
+
+' 全域變數
+Public g_BlockNodeDataCollection As Collection
+Public g_LineSegmentDataCollection As Collection
+Public g_PreviousNodePoint As Variant
+Public g_CurrentNodeIndex As Long
+Public g_CurrentLineIndex As Long
+Public g_ShouldCreateLines As Boolean
+Public g_OriginalLayerName As String
+Public g_NodeTargetLayer As AcadLayer
+Public g_IsSessionActive As Boolean
+Public g_AllNodesDataCollection As Collection
+Public g_AreaRegionDataCollection As Collection
+Public g_TotalNodesCreated As Long
+Public g_TotalLinesCreated As Long
+Public g_TotalAreasCreated As Long
+
+' 常數定義
+Private Const NODE_CIRCLE_RADIUS As Double = 1000
+Private Const DUPLICATE_POINT_TOLERANCE As Double = 1
+Private Const ATTRIBUTE_TEXT_HEIGHT As Double = 2000
+Private Const LINE_ATTRIBUTE_TEXT_HEIGHT As Double = 2000
+Private Const AREA_ATTRIBUTE_TEXT_HEIGHT As Double = 2000
+
+Private Sub StartButton_Click()
+    Call StartOrContinueNodeCreation
+End Sub
+
+Private Sub ExitButton_Click()
+    Call FinishNodeCreation
+End Sub
+
+Private Sub StartOrContinueNodeCreation()
+    Dim blockName As String
+    Dim blockDefinition As AcadBlock
+    Dim blockBasePoint(0 To 2) As Double
+    Dim nodePrefix As String
+    Dim startingNodeIndex As Long
+    Dim nodeLayerName As String
+    Dim localNodeTargetLayer As AcadLayer
+    
+    ' 取得使用者輸入並驗證
+    nodePrefix = Trim(Me.TextBoxPrefix.Value)
+    If nodePrefix = "" Then
+        MsgBox "請輸入代碼前綴！", vbExclamation
+        Exit Sub
+    End If
+    
+    If Trim(Me.TextBoxStartNumber.Value) = "" Or Not IsNumeric(Me.TextBoxStartNumber.Value) Then
+        MsgBox "請輸入正確的起始號碼！", vbExclamation
+        Exit Sub
+    End If
+    
+    ' 如果是第一次執行，初始化所有變數
+    If Not g_IsSessionActive Then
+        Call InitializeGlobalVariables
+        g_ShouldCreateLines = True
+        g_OriginalLayerName = ThisDrawing.ActiveLayer.Name
+        g_IsSessionActive = True
+        
+        Me.ExitButton.Enabled = True
+        
+        startingNodeIndex = CLng(Me.TextBoxStartNumber.Value)
+        g_CurrentNodeIndex = startingNodeIndex
+        g_CurrentLineIndex = startingNodeIndex
+    Else
+        g_CurrentNodeIndex = CLng(Me.TextBoxStartNumber.Value)
+        
+        ' 線段編號邏輯：檢查前綴是否改變
+        If g_LineSegmentDataCollection.Count > 0 Then
+            Dim lastLineData As Variant
+            Dim lastLineLabel As String
+            Dim lastLinePrefix As String
+            Dim dashPos1 As Long, dashPos2 As Long
+            
+            lastLineData = g_LineSegmentDataCollection.Item(g_LineSegmentDataCollection.Count)
+            lastLineLabel = lastLineData(0)
+            
+            dashPos1 = InStr(lastLineLabel, "-")
+            If dashPos1 > 0 Then
+                dashPos2 = InStr(dashPos1 + 1, lastLineLabel, "-")
+                If dashPos2 > 0 Then
+                    lastLinePrefix = Mid(lastLineLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+                    If lastLinePrefix = nodePrefix Then
+                        Dim lastLineNumber As Long
+                        lastLineNumber = CLng(Right(lastLineLabel, 4))
+                        g_CurrentLineIndex = lastLineNumber + 1
+                    Else
+                        g_CurrentLineIndex = CLng(Me.TextBoxStartNumber.Value)
+                    End If
+                Else
+                    g_CurrentLineIndex = CLng(Me.TextBoxStartNumber.Value)
+                End If
+            Else
+                g_CurrentLineIndex = CLng(Me.TextBoxStartNumber.Value)
+            End If
+        Else
+            g_CurrentLineIndex = CLng(Me.TextBoxStartNumber.Value)
+        End If
+        
+        Set g_BlockNodeDataCollection = New Collection
+        g_PreviousNodePoint = Empty
+    End If
+    
+    nodeLayerName = "BLOCK_" & nodePrefix
+    
+    ' 建立或取得節點圖層
+    If CreateOrGetLayer(nodeLayerName, localNodeTargetLayer) Then
+        Set g_NodeTargetLayer = localNodeTargetLayer
+        ThisDrawing.ActiveLayer = g_NodeTargetLayer
+    Else
+        MsgBox "無法建立圖層，程序終止！", vbCritical
+        Exit Sub
+    End If
+
+    ' 建立節點圖塊定義
+    blockName = "MyAutoBlock_" & Format(Now, "hhnnss")
+    Call SetArrayToZero(blockBasePoint)
+    
+    On Error GoTo BlockCreationError
+    Set blockDefinition = ThisDrawing.Blocks.Add(blockBasePoint, blockName)
+    Call CreateNodeBlockGeometry(blockDefinition, g_CurrentNodeIndex, nodePrefix)
+    ThisDrawing.Regen acActiveViewport
+    On Error GoTo 0
+    
+    Call ShowUserPromptAndHideForm(g_ShouldCreateLines, nodeLayerName)
+    Call ExecuteNodeCreationLoop(blockName, nodeLayerName, nodePrefix)
+    
+    Exit Sub
+    
+BlockCreationError:
+    MsgBox "建立圖塊定義時發生錯誤：" & Err.Description, vbCritical
+    Me.show
+End Sub
+
+Private Sub InitializeGlobalVariables()
+    Set g_BlockNodeDataCollection = New Collection
+    Set g_LineSegmentDataCollection = New Collection
+    Set g_AreaRegionDataCollection = New Collection
+    Set g_AllNodesDataCollection = New Collection
+    g_TotalNodesCreated = 0
+    g_TotalLinesCreated = 0
+    g_TotalAreasCreated = 0
+    g_PreviousNodePoint = Empty
+End Sub
+
+Private Sub CreateNodeBlockGeometry(blockDef As AcadBlock, startIndex As Long, prefix As String)
+    Dim circleCenterPoint(0 To 2) As Double
+    Dim verticalLineStart(0 To 2) As Double, verticalLineEnd(0 To 2) As Double
+    Dim horizontalLineStart(0 To 2) As Double, horizontalLineEnd(0 To 2) As Double
+    Dim attributePoint(0 To 2) As Double
+    Dim attributeDefinition As AcadAttribute
+    
+    Call SetArrayToZero(circleCenterPoint)
+    blockDef.AddCircle circleCenterPoint, NODE_CIRCLE_RADIUS
+    
+    verticalLineStart(0) = 0#: verticalLineStart(1) = -NODE_CIRCLE_RADIUS: verticalLineStart(2) = 0#
+    verticalLineEnd(0) = 0#: verticalLineEnd(1) = NODE_CIRCLE_RADIUS: verticalLineEnd(2) = 0#
+    blockDef.AddLine verticalLineStart, verticalLineEnd
+    
+    horizontalLineStart(0) = -NODE_CIRCLE_RADIUS * 1.1: horizontalLineStart(1) = 0#: horizontalLineStart(2) = 0#
+    horizontalLineEnd(0) = NODE_CIRCLE_RADIUS * 1.1: horizontalLineEnd(1) = 0#: horizontalLineEnd(2) = 0#
+    blockDef.AddLine horizontalLineStart, horizontalLineEnd
+    
+    attributePoint(0) = 6#: attributePoint(1) = 6#: attributePoint(2) = 0#
+    Set attributeDefinition = blockDef.AddAttribute(ATTRIBUTE_TEXT_HEIGHT, acAttributeModeVerify, _
+                                                   "LABEL", attributePoint, "LABEL", _
+                                                   "P-" & prefix & Format(startIndex, "0000"))
+End Sub
+
+Private Sub ShowUserPromptAndHideForm(shouldCreateLines As Boolean, layerName As String)
+    Me.Hide
+    Dim promptMessage As String
+    
+    promptMessage = "請在圖面上點選插入位置" & vbCrLf & _
+                   "圖塊將建立在圖層：" & layerName & vbCrLf & _
+                   "按 ESC 鍵刪除上一個節點" & vbCrLf & _
+                   "按 ENTER/SPACE 鍵暫停並回到設定視窗"
+
+    MsgBox promptMessage, vbInformation
+End Sub
+
+Private Sub ExecuteNodeCreationLoop(blockName As String, layerName As String, prefix As String)
+    Dim userInsertPoint As Variant
+    Dim currentNodeIndex As Long
+    Dim currentLineIndex As Long
+    
+    currentNodeIndex = g_CurrentNodeIndex
+    currentLineIndex = g_CurrentLineIndex
+    Set g_BlockNodeDataCollection = New Collection
+    g_PreviousNodePoint = Empty
+    
+    Do
+        On Error Resume Next
+        userInsertPoint = ThisDrawing.Utility.GetPoint(, "請點選節點位置（" & layerName & "）[ENTER暫停 / ESC復原]：")
+        
+        ' 檢查是否有錯誤發生
+        If Err.Number <> 0 Then
+            Dim errorNumber As Long
+            errorNumber = Err.Number
+            On Error GoTo 0
+            
+            If errorNumber = -2147352567 Then  ' ESC 被按下
+                ' ESC：立即復原最後一個節點
+                If UndoLastNode(currentNodeIndex, currentLineIndex, prefix, layerName) Then
+                    ' 成功復原，繼續迴圈，不顯示表單
+                    GoTo ContinueNodeLoop
+                Else
+                    ' 沒有可復原的節點，顯示訊息後繼續
+                    MsgBox "沒有可復原的節點！", vbInformation
+                    GoTo ContinueNodeLoop
+                End If
+            Else
+                ' ENTER 或其他錯誤：暫停並回到表單
+                g_CurrentNodeIndex = currentNodeIndex
+                g_CurrentLineIndex = currentLineIndex
+                Me.TextBoxStartNumber.Value = currentNodeIndex
+                Me.show
+                Exit Do
+            End If
+        End If
+        On Error GoTo 0
+        
+        ' 正常點選處理
+        If IsPointDuplicateInCurrentSession(userInsertPoint, g_BlockNodeDataCollection) Then
+            If g_BlockNodeDataCollection.Count > 0 And Not IsEmpty(g_PreviousNodePoint) Then
+                Dim firstPointData As Variant
+                Dim firstPoint(0 To 2) As Double
+                firstPointData = g_BlockNodeDataCollection.Item(1)
+                firstPoint(0) = firstPointData(1)
+                firstPoint(1) = firstPointData(2)
+                firstPoint(2) = 0#
+                
+                If Not DoesLineExistBetweenPoints(g_PreviousNodePoint, firstPoint, prefix) Then
+                    Call CreateLineBetweenPointsDirect(g_PreviousNodePoint, firstPoint, currentLineIndex, layerName, prefix)
+                    currentLineIndex = currentLineIndex + 1
+                End If
+            End If
+            
+            Call CreateAreaRegionFromPoints(g_BlockNodeDataCollection, layerName, prefix)
+            Set g_BlockNodeDataCollection = New Collection
+            g_PreviousNodePoint = Empty
+            GoTo ContinueNodeLoop
+        End If
+        
+        ' 檢查是否點選到已存在的節點
+        Dim existingNodeData As Variant
+        If FindExistingNodeAtPoint(userInsertPoint, prefix, existingNodeData) Then
+            ' 使用已存在的節點
+            g_BlockNodeDataCollection.Add existingNodeData
+            
+            ' 如果有前一個點，檢查是否需要建立線段
+            If g_ShouldCreateLines And Not IsEmpty(g_PreviousNodePoint) Then
+                If Not DoesLineExistBetweenPoints(g_PreviousNodePoint, userInsertPoint, prefix) Then
+                    Call CreateLineBetweenPointsDirect(g_PreviousNodePoint, userInsertPoint, currentLineIndex, layerName, prefix)
+                    currentLineIndex = currentLineIndex + 1
+                    
+                    ' 檢查當前會話的節點集合是否形成封閉圖形
+                    g_BlockNodeDataCollection.Add existingNodeData
+                    If CheckCurrentSessionClosure(prefix, layerName) Then
+                        ' 成功建立面域後，清空當前會話節點集合
+                        Set g_BlockNodeDataCollection = New Collection
+                        g_PreviousNodePoint = Empty
+                        GoTo ContinueNodeLoop
+                    End If
+                    ' 如果沒有形成封閉，移除剛加入的節點，因為下面會重新加入
+                    g_BlockNodeDataCollection.Remove g_BlockNodeDataCollection.Count
+                End If
+            End If
+            
+            g_PreviousNodePoint = userInsertPoint
+        Else
+            ' 建立新節點
+            Call CreateSingleNode(userInsertPoint, blockName, layerName, prefix, currentNodeIndex)
+            
+            ' 如果有前一個點，建立線段
+            If g_ShouldCreateLines And Not IsEmpty(g_PreviousNodePoint) Then
+                If Not DoesLineExistBetweenPoints(g_PreviousNodePoint, userInsertPoint, prefix) Then
+                    Call CreateLineBetweenPointsDirect(g_PreviousNodePoint, userInsertPoint, currentLineIndex, layerName, prefix)
+                    currentLineIndex = currentLineIndex + 1
+                End If
+            End If
+            
+            g_PreviousNodePoint = userInsertPoint
+            currentNodeIndex = currentNodeIndex + 1
+        End If
+        
+ContinueNodeLoop:
+    Loop
+    
+    g_CurrentNodeIndex = currentNodeIndex
+    g_CurrentLineIndex = currentLineIndex
+End Sub
+
+' 修正後的復原函數 - 優先刪除圖面上的節點圖塊
+Private Function UndoLastNode(ByRef currentNodeIndex As Long, ByRef currentLineIndex As Long, _
+                             prefix As String, layerName As String) As Boolean
+    Dim lastNodeData As Variant
+    Dim nodeLabel As String
+    
+    UndoLastNode = False
+    
+    ' 優先處理全域節點的復原（圖面上實際存在的節點）
+    If g_AllNodesDataCollection.Count > 0 Then
+        ' 取得最後一個節點資料
+        lastNodeData = g_AllNodesDataCollection.Item(g_AllNodesDataCollection.Count)
+        nodeLabel = lastNodeData(0)
+        
+        ' 檢查節點前綴是否匹配當前前綴
+        If IsNodeOfPrefix(nodeLabel, prefix) Then
+            ' 復原相關的線段
+            Call UndoRelatedLines(nodeLabel, prefix, currentLineIndex)
+            
+            ' 復原相關的面域
+            Call UndoRelatedAreas(nodeLabel, prefix)
+            
+            ' 從圖面中刪除節點物件
+            Call DeleteNodeFromDrawing(lastNodeData)
+            
+            ' 從全域集合中移除
+            g_AllNodesDataCollection.Remove g_AllNodesDataCollection.Count
+            g_TotalNodesCreated = g_TotalNodesCreated - 1
+            currentNodeIndex = currentNodeIndex - 1
+            
+            ' 同時從當前會話集合中移除（如果存在的話）
+            Call RemoveNodeFromCurrentSession(nodeLabel)
+            
+            ' 更新前一個節點位置
+            Call UpdatePreviousNodePoint(prefix)
+            
+            UndoLastNode = True
+            Exit Function
+        End If
+    End If
+    
+    ' 如果沒有匹配前綴的全域節點，再處理當前會話中的節點
+    If g_BlockNodeDataCollection.Count > 0 Then
+        lastNodeData = g_BlockNodeDataCollection.Item(g_BlockNodeDataCollection.Count)
+        nodeLabel = lastNodeData(0)
+        
+        ' 從會話集合中移除
+        g_BlockNodeDataCollection.Remove g_BlockNodeDataCollection.Count
+        
+        ' 更新前一個節點位置
+        Call UpdatePreviousNodePoint(prefix)
+        
+        UndoLastNode = True
+    End If
+End Function
+
+' 從當前會話集合中移除指定節點
+Private Sub RemoveNodeFromCurrentSession(nodeLabel As String)
+    Dim i As Long
+    Dim sessionNodeData As Variant
+    
+    For i = g_BlockNodeDataCollection.Count To 1 Step -1
+        sessionNodeData = g_BlockNodeDataCollection.Item(i)
+        If sessionNodeData(0) = nodeLabel Then
+            g_BlockNodeDataCollection.Remove i
+            Exit For
+        End If
+    Next i
+End Sub
+
+' 更新前一個節點位置
+Private Sub UpdatePreviousNodePoint(prefix As String)
+    If g_BlockNodeDataCollection.Count > 0 Then
+        ' 優先使用會話中的最後一個節點
+        Dim prevNodeData As Variant
+        Dim prevPoint(0 To 2) As Double
+        prevNodeData = g_BlockNodeDataCollection.Item(g_BlockNodeDataCollection.Count)
+        prevPoint(0) = CDbl(prevNodeData(1))
+        prevPoint(1) = CDbl(prevNodeData(2))
+        prevPoint(2) = 0#
+        g_PreviousNodePoint = prevPoint
+    ElseIf g_AllNodesDataCollection.Count > 0 Then
+        ' 使用全域集合中相同前綴的最後一個節點
+        Dim prevGlobalNodeData As Variant
+        Dim prevGlobalPoint(0 To 2) As Double
+        Dim prevGlobalNodeLabel As String
+        Dim i As Long
+        
+        ' 從後往前查找相同前綴的節點
+        For i = g_AllNodesDataCollection.Count To 1 Step -1
+            prevGlobalNodeData = g_AllNodesDataCollection.Item(i)
+            prevGlobalNodeLabel = CStr(prevGlobalNodeData(0))
+            If IsNodeOfPrefix(prevGlobalNodeLabel, prefix) Then
+                prevGlobalPoint(0) = CDbl(prevGlobalNodeData(1))
+                prevGlobalPoint(1) = CDbl(prevGlobalNodeData(2))
+                prevGlobalPoint(2) = 0#
+                g_PreviousNodePoint = prevGlobalPoint
+                Exit For
+            End If
+        Next i
+        
+        ' 如果沒有找到相同前綴的節點，清空前一個點
+        If i = 0 Then
+            g_PreviousNodePoint = Empty
+        End If
+    Else
+        g_PreviousNodePoint = Empty
+    End If
+End Sub
+
+' 復原相關線段
+Private Sub UndoRelatedLines(nodeLabel As String, prefix As String, ByRef currentLineIndex As Long)
+    Dim i As Long
+    Dim lineData As Variant
+    Dim lineLabel As String
+    Dim startNodeLabel As String, endNodeLabel As String
+    Dim linesToRemove As Collection
+    Dim removeIndex As Variant
+    
+    Set linesToRemove = New Collection
+    
+    ' 查找與該節點相關的線段
+    For i = 1 To g_LineSegmentDataCollection.Count
+        lineData = g_LineSegmentDataCollection.Item(i)
+        lineLabel = lineData(0)
+        
+        ' 檢查線段前綴
+        If IsLineOfPrefix(lineLabel, prefix) Then
+            ' 獲取線段端點節點標籤
+            startNodeLabel = GetNodeLabelAtPoint(CDbl(lineData(1)), CDbl(lineData(2)), prefix)
+            endNodeLabel = GetNodeLabelAtPoint(CDbl(lineData(3)), CDbl(lineData(4)), prefix)
+            
+            ' 如果線段連接到要復原的節點
+            If startNodeLabel = nodeLabel Or endNodeLabel = nodeLabel Then
+                linesToRemove.Add i
+                ' 從圖面中刪除線段物件
+                Call DeleteLineFromDrawing(lineData)
+                g_TotalLinesCreated = g_TotalLinesCreated - 1
+            End If
+        End If
+    Next i
+    
+    ' 從後往前移除線段（避免索引問題）
+    For i = linesToRemove.Count To 1 Step -1
+        removeIndex = linesToRemove.Item(i)
+        g_LineSegmentDataCollection.Remove removeIndex
+    Next i
+    
+    ' 更新線段索引
+    If g_LineSegmentDataCollection.Count > 0 Then
+        Dim lastLine As Variant
+        lastLine = g_LineSegmentDataCollection.Item(g_LineSegmentDataCollection.Count)
+        Dim lastLineNum As Long
+        lastLineNum = CLng(Right(lastLine(0), 4))
+        currentLineIndex = lastLineNum + 1
+    End If
+End Sub
+
+' 復原相關面域
+Private Sub UndoRelatedAreas(nodeLabel As String, prefix As String)
+    Dim i As Long
+    Dim areaData As Variant
+    Dim areaLabel As String
+    Dim nodeListString As String
+    Dim areasToRemove As Collection
+    Dim removeIndex As Variant
+    
+    Set areasToRemove = New Collection
+    
+    ' 查找包含該節點的面域
+    For i = 1 To g_AreaRegionDataCollection.Count
+        areaData = g_AreaRegionDataCollection.Item(i)
+        areaLabel = CStr(areaData(0))
+        nodeListString = CStr(areaData(5))  ' 節點清單字串
+        
+        ' 檢查面域前綴和是否包含該節點
+        If IsAreaOfPrefix(areaLabel, prefix) And InStr(nodeListString, nodeLabel) > 0 Then
+            areasToRemove.Add i
+            ' 從圖面中刪除面域物件
+            Call DeleteAreaFromDrawing(areaData)
+            g_TotalAreasCreated = g_TotalAreasCreated - 1
+        End If
+    Next i
+    
+    ' 從後往前移除面域（避免索引問題）
+    For i = areasToRemove.Count To 1 Step -1
+        removeIndex = areasToRemove.Item(i)
+        g_AreaRegionDataCollection.Remove removeIndex
+    Next i
+End Sub
+
+' 檢查節點是否屬於指定前綴
+Private Function IsNodeOfPrefix(nodeLabel As String, prefix As String) As Boolean
+    Dim dashPos1 As Long, dashPos2 As Long
+    Dim nodePrefix As String
+    
+    IsNodeOfPrefix = False
+    
+    dashPos1 = InStr(nodeLabel, "-")
+    If dashPos1 > 0 Then
+        dashPos2 = InStr(dashPos1 + 1, nodeLabel, "-")
+        If dashPos2 > 0 Then
+            nodePrefix = Mid(nodeLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+            IsNodeOfPrefix = (nodePrefix = prefix)
+        End If
+    End If
+End Function
+
+' 檢查線段是否屬於指定前綴
+Private Function IsLineOfPrefix(lineLabel As String, prefix As String) As Boolean
+    Dim dashPos1 As Long, dashPos2 As Long
+    Dim linePrefix As String
+    
+    IsLineOfPrefix = False
+    
+    dashPos1 = InStr(lineLabel, "-")
+    If dashPos1 > 0 Then
+        dashPos2 = InStr(dashPos1 + 1, lineLabel, "-")
+        If dashPos2 > 0 Then
+            linePrefix = Mid(lineLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+            IsLineOfPrefix = (linePrefix = prefix)
+        End If
+    End If
+End Function
+
+' 檢查面域是否屬於指定前綴
+Private Function IsAreaOfPrefix(areaLabel As String, prefix As String) As Boolean
+    Dim dashPos1 As Long, dashPos2 As Long
+    Dim areaPrefix As String
+    
+    IsAreaOfPrefix = False
+    
+    dashPos1 = InStr(areaLabel, "-")
+    If dashPos1 > 0 Then
+        dashPos2 = InStr(dashPos1 + 1, areaLabel, "-")
+        If dashPos2 > 0 Then
+            areaPrefix = Mid(areaLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+            IsAreaOfPrefix = (areaPrefix = prefix)
+        End If
+    End If
+End Function
+
+' 從圖面中刪除節點物件
+Private Sub DeleteNodeFromDrawing(nodeData As Variant)
+    Dim entity As AcadEntity
+    Dim blockRef As AcadBlockReference
+    Dim nodeLabel As String
+    Dim attributeReferences As Variant
+    Dim i As Long, j As Long
+    Dim nodeX As Double, nodeY As Double
+    Dim blockX As Double, blockY As Double
+    Dim distance As Double
+    
+    nodeLabel = CStr(nodeData(0))
+    nodeX = CDbl(nodeData(1))
+    nodeY = CDbl(nodeData(2))
+    
+    ' 從後往前遍歷模型空間（避免刪除時索引變化的問題）
+    For i = ThisDrawing.ModelSpace.Count - 1 To 0 Step -1
+        On Error Resume Next
+        Set entity = ThisDrawing.ModelSpace.Item(i)
+        On Error GoTo 0
+        
+        If Not entity Is Nothing Then
+            ' 檢查是否為塊參照
+            If entity.ObjectName = "AcDbBlockReference" Then
+                Set blockRef = entity
+                
+                ' 首先檢查位置是否匹配（避免標籤重複的問題）
+                blockX = blockRef.InsertionPoint(0)
+                blockY = blockRef.InsertionPoint(1)
+                distance = Sqr((nodeX - blockX) ^ 2 + (nodeY - blockY) ^ 2)
+                
+                If distance < DUPLICATE_POINT_TOLERANCE Then
+                    ' 位置匹配，再檢查屬性標籤
+                    On Error Resume Next
+                    attributeReferences = blockRef.GetAttributes
+                    On Error GoTo 0
+                    
+                    If IsArray(attributeReferences) Then
+                        For j = LBound(attributeReferences) To UBound(attributeReferences)
+                            If UCase(attributeReferences(j).TagString) = "LABEL" Then
+                                If attributeReferences(j).TextString = nodeLabel Then
+                                    ' 找到對應的節點，刪除它
+                                    blockRef.Delete
+                                    ThisDrawing.Regen acActiveViewport
+                                    Exit Sub
+                                End If
+                            End If
+                        Next j
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+' 從圖面中刪除線段物件
+Private Sub DeleteLineFromDrawing(lineData As Variant)
+    Dim entity As AcadEntity
+    Dim blockRef As AcadBlockReference
+    Dim lineLabel As String
+    Dim attributeReferences As Variant
+    Dim i As Long, j As Long
+    Dim lineStartX As Double, lineStartY As Double
+    Dim lineEndX As Double, lineEndY As Double
+    Dim lineMidX As Double, lineMidY As Double
+    Dim blockX As Double, blockY As Double
+    Dim distance As Double
+    
+    lineLabel = CStr(lineData(0))
+    lineStartX = CDbl(lineData(1))
+    lineStartY = CDbl(lineData(2))
+    lineEndX = CDbl(lineData(3))
+    lineEndY = CDbl(lineData(4))
+    
+    ' 計算線段中點
+    lineMidX = (lineStartX + lineEndX) / 2
+    lineMidY = (lineStartY + lineEndY) / 2
+    
+    ' 從後往前遍歷模型空間
+    For i = ThisDrawing.ModelSpace.Count - 1 To 0 Step -1
+        On Error Resume Next
+        Set entity = ThisDrawing.ModelSpace.Item(i)
+        On Error GoTo 0
+        
+        If Not entity Is Nothing Then
+            ' 檢查是否為塊參照
+            If entity.ObjectName = "AcDbBlockReference" Then
+                Set blockRef = entity
+                
+                ' 檢查位置是否匹配線段中點
+                blockX = blockRef.InsertionPoint(0)
+                blockY = blockRef.InsertionPoint(1)
+                distance = Sqr((lineMidX - blockX) ^ 2 + (lineMidY - blockY) ^ 2)
+                
+                If distance < DUPLICATE_POINT_TOLERANCE Then
+                    ' 位置匹配，再檢查屬性標籤
+                    On Error Resume Next
+                    attributeReferences = blockRef.GetAttributes
+                    On Error GoTo 0
+                    
+                    If IsArray(attributeReferences) Then
+                        For j = LBound(attributeReferences) To UBound(attributeReferences)
+                            If UCase(attributeReferences(j).TagString) = "LABEL" Then
+                                If attributeReferences(j).TextString = lineLabel Then
+                                    ' 找到對應的線段，刪除它
+                                    blockRef.Delete
+                                    ThisDrawing.Regen acActiveViewport
+                                    Exit Sub
+                                End If
+                            End If
+                        Next j
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+' 從圖面中刪除面域物件
+Private Sub DeleteAreaFromDrawing(areaData As Variant)
+    Dim entity As AcadEntity
+    Dim blockRef As AcadBlockReference
+    Dim areaLabel As String
+    Dim attributeReferences As Variant
+    Dim i As Long, j As Long
+    Dim areaCenterX As Double, areaCenterY As Double
+    Dim blockX As Double, blockY As Double
+    Dim distance As Double
+    
+    areaLabel = CStr(areaData(0))
+    areaCenterX = CDbl(areaData(1))
+    areaCenterY = CDbl(areaData(2))
+    
+    ' 從後往前遍歷模型空間
+    For i = ThisDrawing.ModelSpace.Count - 1 To 0 Step -1
+        On Error Resume Next
+        Set entity = ThisDrawing.ModelSpace.Item(i)
+        On Error GoTo 0
+        
+        If Not entity Is Nothing Then
+            ' 檢查是否為塊參照
+            If entity.ObjectName = "AcDbBlockReference" Then
+                Set blockRef = entity
+                
+                ' 檢查位置是否匹配面域中心點
+                blockX = blockRef.InsertionPoint(0)
+                blockY = blockRef.InsertionPoint(1)
+                distance = Sqr((areaCenterX - blockX) ^ 2 + (areaCenterY - blockY) ^ 2)
+                
+                If distance < DUPLICATE_POINT_TOLERANCE Then
+                    ' 位置匹配，再檢查屬性標籤
+                    On Error Resume Next
+                    attributeReferences = blockRef.GetAttributes
+                    On Error GoTo 0
+                    
+                    If IsArray(attributeReferences) Then
+                        For j = LBound(attributeReferences) To UBound(attributeReferences)
+                            If UCase(attributeReferences(j).TagString) = "LABEL" Then
+                                If attributeReferences(j).TextString = areaLabel Then
+                                    ' 找到對應的面域，刪除它
+                                    blockRef.Delete
+                                    ThisDrawing.Regen acActiveViewport
+                                    Exit Sub
+                                End If
+                            End If
+                        Next j
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+' 修正後的封閉線段檢查邏輯
+Private Function CheckCurrentSessionClosure(prefix As String, layerName As String) As Boolean
+    Dim firstNodeData As Variant
+    Dim lastNodeData As Variant
+    Dim firstNodeLabel As String
+    Dim lastNodeLabel As String
+    
+    CheckCurrentSessionClosure = False
+    
+    ' 檢查當前會話是否至少有3個節點
+    If g_BlockNodeDataCollection.Count < 3 Then
+        Exit Function
+    End If
+    
+    ' 獲取第一個和最後一個節點
+    firstNodeData = g_BlockNodeDataCollection.Item(1)
+    lastNodeData = g_BlockNodeDataCollection.Item(g_BlockNodeDataCollection.Count)
+    firstNodeLabel = CStr(firstNodeData(0))
+    lastNodeLabel = CStr(lastNodeData(0))
+    
+    ' 檢查第一個和最後一個節點是否相同（形成封閉）
+    ' 修正：改為 >= 3 而不是 >= 4，因為復原後可能只有3個有效節點
+    If firstNodeLabel = lastNodeLabel And g_BlockNodeDataCollection.Count >= 3 Then
+        ' 移除重複的最後一個節點
+        g_BlockNodeDataCollection.Remove g_BlockNodeDataCollection.Count
+        
+        ' 建立面域
+        Call CreateAreaRegionFromExistingNodes(g_BlockNodeDataCollection, layerName, prefix)
+        CheckCurrentSessionClosure = True
+        
+        MsgBox "偵測到封閉圖形！已自動建立面域 A-" & prefix & "-" & Format(GetNextAreaIndex(prefix) - 1, "0000"), vbInformation
+    End If
+End Function
+
+' 從已存在的節點建立面域
+Private Sub CreateAreaRegionFromExistingNodes(nodesCollection As Collection, layerName As String, prefix As String)
+    Dim areaBlockName As String
+    Dim areaBlockDefinition As AcadBlock
+    Dim areaBlockReference As AcadBlockReference
+    Dim basePoint(0 To 2) As Double
+    Dim areaCentroid(0 To 2) As Double
+    Dim polygonVertices() As Double
+    Dim currentAreaIndex As Long
+    Dim currentAreaLabel As String
+    
+    If nodesCollection.Count < 3 Then Exit Sub
+    
+    On Error GoTo AreaCreationError
+    
+    Call CreateVertexArrayAndCalculateCentroid(nodesCollection, polygonVertices, areaCentroid)
+    
+    ' 獲取下一個面域索引
+    currentAreaIndex = GetNextAreaIndex(prefix)
+    currentAreaLabel = "A-" & prefix & "-" & Format(currentAreaIndex, "0000")
+    
+    areaBlockName = "AreaBlock_" & Format(Now, "hhnnss") & "_" & currentAreaIndex
+    Call SetArrayToZero(basePoint)
+    Set areaBlockDefinition = ThisDrawing.Blocks.Add(basePoint, areaBlockName)
+    
+    Call CreateAreaBlockGeometry(areaBlockDefinition, nodesCollection, areaCentroid, currentAreaLabel)
+    ThisDrawing.Regen acActiveViewport
+    Call InsertAndConfigureAreaBlock(areaCentroid, areaBlockName, layerName, currentAreaLabel)
+    Call SaveAreaRegionData(nodesCollection, areaCentroid, layerName, currentAreaLabel, currentAreaIndex)
+    
+    Exit Sub
+    
+AreaCreationError:
+    MsgBox "建立面域時發生錯誤：" & Err.Description, vbCritical
+End Sub
+
+' 獲取下一個面域索引
+Private Function GetNextAreaIndex(prefix As String) As Long
+    Dim currentAreaIndex As Long
+    
+    currentAreaIndex = 1
+    If g_AreaRegionDataCollection.Count > 0 Then
+        Dim lastAreaData As Variant
+        Dim lastAreaLabel As String
+        Dim lastAreaPrefix As String
+        Dim dashPos1 As Long, dashPos2 As Long
+        
+        lastAreaData = g_AreaRegionDataCollection.Item(g_AreaRegionDataCollection.Count)
+        lastAreaLabel = lastAreaData(0)
+        
+        dashPos1 = InStr(lastAreaLabel, "-")
+        If dashPos1 > 0 Then
+            dashPos2 = InStr(dashPos1 + 1, lastAreaLabel, "-")
+            If dashPos2 > 0 Then
+                lastAreaPrefix = Mid(lastAreaLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+                If lastAreaPrefix = prefix Then
+                    Dim lastAreaNumber As Long
+                    lastAreaNumber = CLng(Right(lastAreaLabel, 4))
+                    currentAreaIndex = lastAreaNumber + 1
+                End If
+            End If
+        End If
+    End If
+    
+    GetNextAreaIndex = currentAreaIndex
+End Function
+
+' 根據座標獲取節點標籤
+Private Function GetNodeLabelAtPoint(x As Double, y As Double, prefix As String) As String
+    Dim i As Long
+    Dim nodeData As Variant
+    Dim nodePrefix As String
+    Dim dashPos1 As Long, dashPos2 As Long
+    Dim pointDistance As Double
+    
+    GetNodeLabelAtPoint = ""
+    
+    For i = 1 To g_AllNodesDataCollection.Count
+        nodeData = g_AllNodesDataCollection.Item(i)
+        
+        ' 檢查節點前綴
+        Dim nodeLabel As String
+        nodeLabel = nodeData(0)
+        dashPos1 = InStr(nodeLabel, "-")
+        If dashPos1 > 0 Then
+            dashPos2 = InStr(dashPos1 + 1, nodeLabel, "-")
+            If dashPos2 > 0 Then
+                nodePrefix = Mid(nodeLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+                If nodePrefix = prefix Then
+                    pointDistance = Sqr((x - nodeData(1)) ^ 2 + (y - nodeData(2)) ^ 2)
+                    If pointDistance < DUPLICATE_POINT_TOLERANCE Then
+                        GetNodeLabelAtPoint = nodeLabel
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+' 檢查指定點是否已存在相同前綴的節點
+Private Function FindExistingNodeAtPoint(testPoint As Variant, prefix As String, ByRef nodeData As Variant) As Boolean
+    Dim i As Long
+    Dim existingNodeData As Variant
+    Dim pointDistance As Double
+    Dim nodePrefix As String
+    Dim dashPos1 As Long, dashPos2 As Long
+    
+    FindExistingNodeAtPoint = False
+    
+    For i = 1 To g_AllNodesDataCollection.Count
+        existingNodeData = g_AllNodesDataCollection.Item(i)
+        
+        ' 檢查節點前綴是否匹配
+        Dim nodeLabel As String
+        nodeLabel = existingNodeData(0)
+        dashPos1 = InStr(nodeLabel, "-")
+        If dashPos1 > 0 Then
+            dashPos2 = InStr(dashPos1 + 1, nodeLabel, "-")
+            If dashPos2 > 0 Then
+                nodePrefix = Mid(nodeLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+                If nodePrefix = prefix Then
+                    ' 計算距離
+                    pointDistance = Sqr((testPoint(0) - existingNodeData(1)) ^ 2 + (testPoint(1) - existingNodeData(2)) ^ 2)
+                    If pointDistance < DUPLICATE_POINT_TOLERANCE Then
+                        nodeData = existingNodeData
+                        FindExistingNodeAtPoint = True
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+' 檢查兩點之間是否已存在相同前綴的線段
+Private Function DoesLineExistBetweenPoints(point1 As Variant, point2 As Variant, prefix As String) As Boolean
+    Dim i As Long
+    Dim lineData As Variant
+    Dim linePrefix As String
+    Dim dashPos1 As Long, dashPos2 As Long
+    Dim startX As Double, startY As Double, endX As Double, endY As Double
+    Dim tolerance As Double
+    
+    DoesLineExistBetweenPoints = False
+    tolerance = DUPLICATE_POINT_TOLERANCE
+    
+    For i = 1 To g_LineSegmentDataCollection.Count
+        lineData = g_LineSegmentDataCollection.Item(i)
+        
+        ' 檢查線段前綴是否匹配
+        Dim lineLabel As String
+        lineLabel = lineData(0)
+        dashPos1 = InStr(lineLabel, "-")
+        If dashPos1 > 0 Then
+            dashPos2 = InStr(dashPos1 + 1, lineLabel, "-")
+            If dashPos2 > 0 Then
+                linePrefix = Mid(lineLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+                If linePrefix = prefix Then
+                    startX = lineData(1)
+                    startY = lineData(2)
+                    endX = lineData(3)
+                    endY = lineData(4)
+                    
+                    ' 檢查是否為相同的線段（正向或反向）
+                    If (Abs(point1(0) - startX) < tolerance And Abs(point1(1) - startY) < tolerance And _
+                        Abs(point2(0) - endX) < tolerance And Abs(point2(1) - endY) < tolerance) Or _
+                       (Abs(point1(0) - endX) < tolerance And Abs(point1(1) - endY) < tolerance And _
+                        Abs(point2(0) - startX) < tolerance And Abs(point2(1) - startY) < tolerance) Then
+                        DoesLineExistBetweenPoints = True
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+Private Function IsPointDuplicateInCurrentSession(testPoint As Variant, pointsCollection As Collection) As Boolean
+    Dim i As Long
+    Dim blockNodeData As Variant
+    Dim pointDistance As Double
+    
+    IsPointDuplicateInCurrentSession = False
+    
+    If pointsCollection.Count < 3 Then Exit Function
+    
+    For i = 1 To pointsCollection.Count
+        blockNodeData = pointsCollection.Item(i)
+        pointDistance = Sqr((testPoint(0) - blockNodeData(1)) ^ 2 + (testPoint(1) - blockNodeData(2)) ^ 2)
+        If pointDistance < DUPLICATE_POINT_TOLERANCE Then
+            IsPointDuplicateInCurrentSession = True
+            Exit Function
+        End If
+    Next i
+End Function
+
+Private Sub CreateSingleNode(insertPoint As Variant, blockName As String, layerName As String, prefix As String, nodeIndex As Long)
+    Dim blockReference As AcadBlockReference
+    Dim currentNodeLabel As String
+    Dim blockNodeData As Variant
+    
+    ThisDrawing.ActiveLayer = g_NodeTargetLayer
+    
+    Set blockReference = ThisDrawing.ModelSpace.InsertBlock(insertPoint, blockName, 1#, 1#, 1#, 0#)
+    blockReference.layer = layerName
+    blockReference.Update
+    
+    currentNodeLabel = "P-" & prefix & "-" & Format(nodeIndex, "0000")
+    Call SetBlockAttribute(blockReference, "LABEL", currentNodeLabel, layerName)
+    
+    ReDim blockNodeData(0 To 3)
+    blockNodeData(0) = currentNodeLabel
+    blockNodeData(1) = insertPoint(0)
+    blockNodeData(2) = insertPoint(1)
+    blockNodeData(3) = layerName
+    
+    g_BlockNodeDataCollection.Add blockNodeData
+    g_AllNodesDataCollection.Add blockNodeData
+    g_TotalNodesCreated = g_TotalNodesCreated + 1
+End Sub
+
+Private Sub SetBlockAttribute(blockRef As AcadBlockReference, tagName As String, textValue As String, layerName As String)
+    Dim attributeReferences As Variant
+    Dim i As Long
+    
+    On Error Resume Next
+    attributeReferences = blockRef.GetAttributes
+    On Error GoTo 0
+    
+    If IsArray(attributeReferences) Then
+        For i = LBound(attributeReferences) To UBound(attributeReferences)
+            If UCase(attributeReferences(i).TagString) = UCase(tagName) Then
+                attributeReferences(i).TextString = textValue
+                attributeReferences(i).layer = layerName
+                attributeReferences(i).Update
+                Exit For
+            End If
+        Next i
+    End If
+End Sub
+
+Private Sub FinishNodeCreation()
+    On Error Resume Next
+    ThisDrawing.ActiveLayer = ThisDrawing.Layers.Item(g_OriginalLayerName)
+    On Error GoTo 0
+    
+    If g_AllNodesDataCollection.Count > 0 Or g_LineSegmentDataCollection.Count > 0 Then
+        Call ExportCombinedDataToExcel(g_AllNodesDataCollection, g_LineSegmentDataCollection)
+    End If
+    
+    Call ShowCompletionMessage
+    Call ResetSessionState
+    Me.Hide
+End Sub
+
+Private Sub ShowCompletionMessage()
+    Dim resultMessage As String
+    
+    resultMessage = "建立完成！" & vbCrLf & _
+                   "節點數量：" & g_TotalNodesCreated & " 個"
+                   
+    If g_ShouldCreateLines And g_TotalLinesCreated > 0 Then
+        resultMessage = resultMessage & vbCrLf & _
+                       "線段數量：" & g_TotalLinesCreated & " 條"
+    End If
+    
+    If g_TotalAreasCreated > 0 Then
+        resultMessage = resultMessage & vbCrLf & _
+                       "面域數量：" & g_TotalAreasCreated & " 個"
+    End If
+    
+    resultMessage = resultMessage & vbCrLf & "資料已輸出至Excel。"
+    
+    MsgBox resultMessage, vbInformation
+End Sub
+
+Private Sub ResetSessionState()
+    g_IsSessionActive = False
+    Set g_BlockNodeDataCollection = Nothing
+    Set g_LineSegmentDataCollection = Nothing
+    Set g_AreaRegionDataCollection = Nothing
+    Set g_AllNodesDataCollection = Nothing
+    g_TotalNodesCreated = 0
+    g_TotalLinesCreated = 0
+    g_TotalAreasCreated = 0
+    g_PreviousNodePoint = Empty
+    
+    Me.ExitButton.Enabled = False
+    Me.ExitButton.Caption = "結束"
+End Sub
+
+Private Sub CreateLineBetweenPointsDirect(startPoint As Variant, endPoint As Variant, lineIndex As Long, layerName As String, prefix As String)
+    Dim lineBlockName As String
+    Dim lineBlockDefinition As AcadBlock
+    Dim lineBlockReference As AcadBlockReference
+    Dim basePoint(0 To 2) As Double
+    Dim segmentMidPoint(0 To 2) As Double
+    Dim segmentLength As Double
+    Dim segmentAngle As Double
+    Dim actualLineIndex As Long
+
+    On Error Resume Next
+    If g_LineSegmentDataCollection Is Nothing Then
+        Set g_LineSegmentDataCollection = New Collection
+    End If
+    On Error GoTo 0
+    
+    ' 檢查當前前綴的線段編號
+    actualLineIndex = 1
+    If g_LineSegmentDataCollection.Count > 0 Then
+        Dim lastLineData As Variant
+        Dim lastLineLabel As String
+        Dim lastLinePrefix As String
+        Dim dashPos1 As Long, dashPos2 As Long
+        
+        lastLineData = g_LineSegmentDataCollection.Item(g_LineSegmentDataCollection.Count)
+        lastLineLabel = lastLineData(0)
+        
+        dashPos1 = InStr(lastLineLabel, "-")
+        If dashPos1 > 0 Then
+            dashPos2 = InStr(dashPos1 + 1, lastLineLabel, "-")
+            If dashPos2 > 0 Then
+                lastLinePrefix = Mid(lastLineLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+                If lastLinePrefix = prefix Then
+                    Dim lastLineNumber As Long
+                    lastLineNumber = CLng(Right(lastLineLabel, 4))
+                    actualLineIndex = lastLineNumber + 1
+                End If
+            End If
+        End If
+    End If
+    
+    Call CalculateLineSegmentGeometry(startPoint, endPoint, segmentLength, segmentAngle, segmentMidPoint)
+    
+    lineBlockName = "LineBlock_" & Format(Now, "hhnnss") & "_" & actualLineIndex
+    Call SetArrayToZero(basePoint)
+    
+    On Error GoTo LineBlockCreationError
+    Set lineBlockDefinition = ThisDrawing.Blocks.Add(basePoint, lineBlockName)
+    Call CreateLineBlockGeometry(lineBlockDefinition, startPoint, endPoint, segmentMidPoint, actualLineIndex, prefix)
+    ThisDrawing.Regen acActiveViewport
+    On Error GoTo 0
+    
+    Call InsertAndConfigureLineBlock(segmentMidPoint, lineBlockName, layerName, actualLineIndex, prefix)
+    Call SaveLineSegmentData(startPoint, endPoint, segmentLength, segmentAngle, layerName, actualLineIndex, prefix)
+    
+    Exit Sub
+    
+LineBlockCreationError:
+    MsgBox "建立線段圖塊定義時發生錯誤：" & Err.Description, vbCritical
+End Sub
+
+Private Sub CalculateLineSegmentGeometry(startPoint As Variant, endPoint As Variant, _
+                                       ByRef length As Double, ByRef angle As Double, _
+                                       ByRef midPoint() As Double)
+    Dim deltaX As Double, deltaY As Double
+    
+    deltaX = endPoint(0) - startPoint(0)
+    deltaY = endPoint(1) - startPoint(1)
+    length = Sqr(deltaX ^ 2 + deltaY ^ 2)
+    
+    If deltaX = 0 Then
+        If deltaY > 0 Then
+            angle = 3.14159 / 2
+        Else
+            angle = -3.14159 / 2
+        End If
+    Else
+        angle = Atn(deltaY / deltaX)
+        If deltaX < 0 Then
+            angle = angle + 3.14159
+        ElseIf deltaY < 0 Then
+            angle = angle + 2 * 3.14159
+        End If
+    End If
+    
+    midPoint(0) = (startPoint(0) + endPoint(0)) / 2
+    midPoint(1) = (startPoint(1) + endPoint(1)) / 2
+    midPoint(2) = 0#
+End Sub
+
+Private Sub CreateLineBlockGeometry(blockDef As AcadBlock, startPoint As Variant, endPoint As Variant, _
+                                  midPoint() As Double, lineIndex As Long, prefix As String)
+    Dim relativeStartPoint(0 To 2) As Double, relativeEndPoint(0 To 2) As Double
+    Dim relativeAttributePoint(0 To 2) As Double
+    Dim attributeDefinition As AcadAttribute
+    
+    relativeStartPoint(0) = startPoint(0) - midPoint(0)
+    relativeStartPoint(1) = startPoint(1) - midPoint(1)
+    relativeStartPoint(2) = 0#
+    relativeEndPoint(0) = endPoint(0) - midPoint(0)
+    relativeEndPoint(1) = endPoint(1) - midPoint(1)
+    relativeEndPoint(2) = 0#
+    
+    blockDef.AddLine relativeStartPoint, relativeEndPoint
+    
+    relativeAttributePoint(0) = 0#: relativeAttributePoint(1) = 2#: relativeAttributePoint(2) = 0#
+    Set attributeDefinition = blockDef.AddAttribute(LINE_ATTRIBUTE_TEXT_HEIGHT, acAttributeModeVerify, _
+                                                   "LABEL", relativeAttributePoint, "LABEL", _
+                                                   "L-" & prefix & "-" & Format(lineIndex, "0000"))
+End Sub
+
+Private Sub InsertAndConfigureLineBlock(midPoint() As Double, blockName As String, _
+                                      layerName As String, lineIndex As Long, prefix As String)
+    Dim lineBlockReference As AcadBlockReference
+    Dim currentLineLabel As String
+    
+    On Error Resume Next
+    If Not g_NodeTargetLayer Is Nothing Then
+        ThisDrawing.ActiveLayer = g_NodeTargetLayer
+    End If
+    On Error GoTo 0
+    
+    Set lineBlockReference = ThisDrawing.ModelSpace.InsertBlock(midPoint, blockName, 1#, 1#, 1#, 0#)
+    lineBlockReference.layer = layerName
+    lineBlockReference.Update
+    
+    currentLineLabel = "L-" & prefix & "-" & Format(lineIndex, "0000")
+    Call SetBlockAttribute(lineBlockReference, "LABEL", currentLineLabel, layerName)
+End Sub
+
+Private Sub SaveLineSegmentData(startPoint As Variant, endPoint As Variant, _
+                               length As Double, angle As Double, layerName As String, _
+                               lineIndex As Long, prefix As String)
+    Dim lineSegmentData As Variant
+    Dim currentLineLabel As String
+    
+    currentLineLabel = "L-" & prefix & "-" & Format(lineIndex, "0000")
+    
+    ReDim lineSegmentData(0 To 7)
+    lineSegmentData(0) = currentLineLabel
+    lineSegmentData(1) = Round(startPoint(0), 3)
+    lineSegmentData(2) = Round(startPoint(1), 3)
+    lineSegmentData(3) = Round(endPoint(0), 3)
+    lineSegmentData(4) = Round(endPoint(1), 3)
+    lineSegmentData(5) = Round(length, 3)
+    lineSegmentData(6) = Round(angle * 180 / 3.14159, 2)
+    lineSegmentData(7) = layerName
+    
+    g_LineSegmentDataCollection.Add lineSegmentData
+    g_TotalLinesCreated = g_TotalLinesCreated + 1
+End Sub
+
+Private Function CreateOrGetLayer(layerName As String, ByRef targetLayer As AcadLayer) As Boolean
+    Dim i As Long
+    Dim existingLayer As AcadLayer
+    
+    CreateOrGetLayer = False
+    Set targetLayer = Nothing
+    
+    For i = 0 To ThisDrawing.Layers.Count - 1
+        Set existingLayer = ThisDrawing.Layers.Item(i)
+        If existingLayer.Name = layerName Then
+            Set targetLayer = existingLayer
+            CreateOrGetLayer = True
+            GoTo SetLayerProperties
+        End If
+    Next i
+    
+    On Error GoTo CreateLayerError
+    Set targetLayer = ThisDrawing.Layers.Add(layerName)
+    CreateOrGetLayer = True
+    
+SetLayerProperties:
+    On Error Resume Next
+    If Not targetLayer Is Nothing Then
+        targetLayer.color = acRed
+        targetLayer.Plottable = False
+    End If
+    On Error GoTo 0
+    
+    Exit Function
+    
+CreateLayerError:
+    MsgBox "無法建立圖層：" & layerName & vbCrLf & _
+           "錯誤：" & Err.Description, vbCritical
+    CreateOrGetLayer = False
+End Function
+
+Private Sub ExportCombinedDataToExcel(nodeDataCollection As Collection, lineDataCollection As Collection)
+    Dim excelApplication As Object
+    Dim excelWorkbook As Object
+    
+    On Error GoTo ExcelExportError
+    
+    Set excelApplication = CreateObject("Excel.Application")
+    excelApplication.Visible = True
+    Set excelWorkbook = excelApplication.Workbooks.Add
+    
+    Call CreateNodeDataWorksheet(excelWorkbook, nodeDataCollection)
+
+    If lineDataCollection.Count > 0 Then
+        Call CreateLineDataWorksheet(excelWorkbook, lineDataCollection)
+        Call CreateLineDataWorksheet2(excelWorkbook, lineDataCollection, nodeDataCollection)
+    End If
+
+    If g_AreaRegionDataCollection.Count > 0 Then
+        Call CreateAreaDataWorksheet(excelWorkbook, g_AreaRegionDataCollection)
+    End If
+    
+    Call SaveExcelFile(excelWorkbook)
+    
+    Exit Sub
+    
+ExcelExportError:
+    MsgBox "輸出Excel時發生錯誤：" & Err.Description, vbCritical
+    If Not excelApplication Is Nothing Then
+        excelApplication.Quit
+        Set excelApplication = Nothing
+    End If
+End Sub
+
+Private Sub CreateNodeDataWorksheet(workbook As Object, nodeDataCollection As Collection)
+    Dim nodeWorksheet As Object
+    Dim i As Long
+    Dim blockNodeData As Variant
+    
+    Set nodeWorksheet = workbook.ActiveSheet
+    nodeWorksheet.Name = "節點清單"
+    
+    With nodeWorksheet
+        .Cells(1, 1).Value = "節點標籤"
+        .Cells(1, 2).Value = "X座標"
+        .Cells(1, 3).Value = "Y座標"
+        .Cells(1, 4).Value = "圖層名稱"
+    End With
+    
+    With nodeWorksheet.Range("A1:D1")
+        .Font.Bold = True
+        .Interior.color = RGB(200, 200, 200)
+        .Borders.Weight = 2
+    End With
+    
+    For i = 1 To nodeDataCollection.Count
+        blockNodeData = nodeDataCollection.Item(i)
+        With nodeWorksheet
+            .Cells(i + 1, 1).Value = blockNodeData(0)
+            .Cells(i + 1, 2).Value = Round(blockNodeData(1), 3)
+            .Cells(i + 1, 3).Value = Round(blockNodeData(2), 3)
+            .Cells(i + 1, 4).Value = blockNodeData(3)
+        End With
+    Next i
+    
+    nodeWorksheet.Columns("A:D").AutoFit
+End Sub
+
+Private Sub CreateLineDataWorksheet(workbook As Object, lineDataCollection As Collection)
+    Dim lineWorksheet As Object
+    Dim i As Long
+    Dim lineSegmentData As Variant
+    
+    Set lineWorksheet = workbook.Worksheets.Add
+    lineWorksheet.Name = "線段清單"
+    
+    With lineWorksheet
+        .Cells(1, 1).Value = "線段標籤"
+        .Cells(1, 2).Value = "起點X"
+        .Cells(1, 3).Value = "起點Y"
+        .Cells(1, 4).Value = "終點X"
+        .Cells(1, 5).Value = "終點Y"
+        .Cells(1, 6).Value = "長度"
+        .Cells(1, 7).Value = "角度(度)"
+        .Cells(1, 8).Value = "圖層名稱"
+    End With
+    
+    With lineWorksheet.Range("A1:H1")
+        .Font.Bold = True
+        .Interior.color = RGB(200, 200, 200)
+        .Borders.Weight = 2
+    End With
+    
+    For i = 1 To lineDataCollection.Count
+        lineSegmentData = lineDataCollection.Item(i)
+        With lineWorksheet
+            .Cells(i + 1, 1).Value = lineSegmentData(0)
+            .Cells(i + 1, 2).Value = lineSegmentData(1)
+            .Cells(i + 1, 3).Value = lineSegmentData(2)
+            .Cells(i + 1, 4).Value = lineSegmentData(3)
+            .Cells(i + 1, 5).Value = lineSegmentData(4)
+            .Cells(i + 1, 6).Value = lineSegmentData(5)
+            .Cells(i + 1, 7).Value = lineSegmentData(6)
+            .Cells(i + 1, 8).Value = lineSegmentData(7)
+        End With
+    Next i
+    
+    lineWorksheet.Columns("A:H").AutoFit
+End Sub
+
+Private Sub CreateLineDataWorksheet2(workbook As Object, lineDataCollection As Collection, nodeDataCollection As Collection)
+    Dim lineWorksheet2 As Object
+    Dim i As Long
+    Dim lineSegmentData As Variant
+    Dim startNodeLabel As String
+    Dim endNodeLabel As String
+    Dim lineLabel As String
+    Dim linePrefix As String
+    Dim dashPos1 As Long, dashPos2 As Long
+
+    Set lineWorksheet2 = workbook.Worksheets.Add
+    lineWorksheet2.Name = "線段清單2"
+
+    With lineWorksheet2
+        .Cells(1, 1).Value = "線段標籤"
+        .Cells(1, 2).Value = "起點節點標籤"
+        .Cells(1, 3).Value = "終點節點標籤"
+    End With
+
+    With lineWorksheet2.Range("A1:C1")
+        .Font.Bold = True
+        .Interior.color = RGB(200, 200, 200)
+        .Borders.Weight = 2
+    End With
+
+    ' 填入資料
+    For i = 1 To lineDataCollection.Count
+        lineSegmentData = lineDataCollection.Item(i)
+        lineLabel = lineSegmentData(0)
+
+        ' 從線段標籤中取得前綴
+        dashPos1 = InStr(lineLabel, "-")
+        If dashPos1 > 0 Then
+            dashPos2 = InStr(dashPos1 + 1, lineLabel, "-")
+            If dashPos2 > 0 Then
+                linePrefix = Mid(lineLabel, dashPos1 + 1, dashPos2 - dashPos1 - 1)
+            End If
+        End If
+
+        ' 根據起點和終點座標找到對應的節點標籤
+        startNodeLabel = GetNodeLabelAtPoint(CDbl(lineSegmentData(1)), CDbl(lineSegmentData(2)), linePrefix)
+        endNodeLabel = GetNodeLabelAtPoint(CDbl(lineSegmentData(3)), CDbl(lineSegmentData(4)), linePrefix)
+
+        With lineWorksheet2
+            .Cells(i + 1, 1).Value = lineLabel
+            .Cells(i + 1, 2).Value = startNodeLabel
+            .Cells(i + 1, 3).Value = endNodeLabel
+        End With
+    Next i
+
+    lineWorksheet2.Columns("A:C").AutoFit
+End Sub
+
+Private Sub CreateAreaDataWorksheet(workbook As Object, areaDataCollection As Collection)
+    Dim areaWorksheet As Object
+    Dim i As Long
+    Dim areaRegionData As Variant
+    Dim nodeListString As String
+    Dim nodeLabels() As String
+    Dim j As Long
+    Dim maxNodes As Long
+
+    Set areaWorksheet = workbook.Worksheets.Add
+    areaWorksheet.Name = "面域清單"
+
+    ' 找出最多節點數量，用於設定欄位
+    maxNodes = 0
+    For i = 1 To areaDataCollection.Count
+        areaRegionData = areaDataCollection.Item(i)
+        If areaRegionData(3) > maxNodes Then maxNodes = areaRegionData(3)
+    Next i
+
+    ' 設定標題列
+    With areaWorksheet
+        .Cells(1, 1).Value = "面域標籤"
+        .Cells(1, 2).Value = "中心點X"
+        .Cells(1, 3).Value = "中心點Y"
+        .Cells(1, 4).Value = "頂點數量"
+        .Cells(1, 5).Value = "圖層名稱"
+        .Cells(1, 6).Value = "面積"
+        ' 動態建立節點欄位標題
+        For j = 1 To maxNodes
+            .Cells(1, 6 + j).Value = "節點" & j
+        Next j
+    End With
+
+    ' 格式化標題列
+    With areaWorksheet.Range(areaWorksheet.Cells(1, 1), areaWorksheet.Cells(1, 6 + maxNodes))
+        .Font.Bold = True
+        .Interior.color = RGB(200, 200, 200)
+        .Borders.Weight = 2
+    End With
+
+    ' 填入資料
+    For i = 1 To areaDataCollection.Count
+        areaRegionData = areaDataCollection.Item(i)
+        With areaWorksheet
+            .Cells(i + 1, 1).Value = areaRegionData(0) ' 面域標籤
+            .Cells(i + 1, 2).Value = areaRegionData(1) ' 中心點X
+            .Cells(i + 1, 3).Value = areaRegionData(2) ' 中心點Y
+            .Cells(i + 1, 4).Value = areaRegionData(3) ' 頂點數量
+            .Cells(i + 1, 5).Value = areaRegionData(4) ' 圖層名稱
+            .Cells(i + 1, 6).Value = areaRegionData(6) ' 面積
+
+            ' 將節點清單拆分並填入個別儲存格
+            nodeListString = areaRegionData(5)
+            nodeLabels = Split(nodeListString, ", ")
+            For j = 0 To UBound(nodeLabels)
+                .Cells(i + 1, 7 + j).Value = nodeLabels(j)
+            Next j
+        End With
+    Next i
+
+    areaWorksheet.Columns("A:Z").AutoFit
+End Sub
+
+Private Sub SaveExcelFile(workbook As Object)
+    Dim fileName As String
+    fileName = ThisDrawing.Path & "\節點線段清單_" & Format(Now, "yyyymmdd_hhnnss") & ".xlsx"
+    workbook.SaveAs fileName
+    MsgBox "Excel檔案已儲存至：" & vbCrLf & fileName, vbInformation
+End Sub
+
+Private Sub CreateAreaRegionFromPoints(pointsCollection As Collection, layerName As String, prefix As String)
+    Dim polygonVertices() As Double
+    Dim areaBlockName As String
+    Dim areaBlockDefinition As AcadBlock
+    Dim areaBlockReference As AcadBlockReference
+    Dim basePoint(0 To 2) As Double
+    Dim areaCentroid(0 To 2) As Double
+    Dim currentAreaIndex As Long
+    Dim currentAreaLabel As String
+    
+    If pointsCollection.Count < 3 Then
+        MsgBox "至少需要3個點才能建立面域！", vbExclamation
+        Exit Sub
+    End If
+    
+    On Error GoTo AreaCreationError
+    
+    Call CreateVertexArrayAndCalculateCentroid(pointsCollection, polygonVertices, areaCentroid)
+    
+    ' 檢查相同前綴的面域編號
+    currentAreaIndex = GetNextAreaIndex(prefix)
+    currentAreaLabel = "A-" & prefix & "-" & Format(currentAreaIndex, "0000")
+    
+    areaBlockName = "AreaBlock_" & Format(Now, "hhnnss") & "_" & currentAreaIndex
+    Call SetArrayToZero(basePoint)
+    Set areaBlockDefinition = ThisDrawing.Blocks.Add(basePoint, areaBlockName)
+    
+    Call CreateAreaBlockGeometry(areaBlockDefinition, pointsCollection, areaCentroid, currentAreaLabel)
+    ThisDrawing.Regen acActiveViewport
+    Call InsertAndConfigureAreaBlock(areaCentroid, areaBlockName, layerName, currentAreaLabel)
+    Call SaveAreaRegionData(pointsCollection, areaCentroid, layerName, currentAreaLabel, currentAreaIndex)
+    
+    Exit Sub
+    
+AreaCreationError:
+    MsgBox "建立面域時發生錯誤：" & Err.Description, vbCritical
+End Sub
+
+Private Sub CreateVertexArrayAndCalculateCentroid(pointsCollection As Collection, _
+                                                ByRef vertices() As Double, _
+                                                ByRef centroid() As Double)
+    Dim i As Long
+    Dim blockNodeData As Variant
+    Dim sumX As Double, sumY As Double
+    
+    ReDim vertices(0 To pointsCollection.Count * 2 - 1)
+    For i = 1 To pointsCollection.Count
+        blockNodeData = pointsCollection.Item(i)
+        vertices((i - 1) * 2) = blockNodeData(1)
+        vertices((i - 1) * 2 + 1) = blockNodeData(2)
+    Next i
+    
+    For i = 1 To pointsCollection.Count
+        blockNodeData = pointsCollection.Item(i)
+        sumX = sumX + blockNodeData(1)
+        sumY = sumY + blockNodeData(2)
+    Next i
+    
+    centroid(0) = sumX / pointsCollection.Count
+    centroid(1) = sumY / pointsCollection.Count
+    centroid(2) = 0#
+End Sub
+
+Private Sub CreateAreaBlockGeometry(blockDef As AcadBlock, pointsCollection As Collection, _
+                                  centroid() As Double, areaLabel As String)
+    Dim relativeVertices() As Double
+    Dim blockNodeData As Variant
+    Dim i As Long
+    Dim areaPolyline As AcadLWPolyline
+    Dim attributePoint(0 To 2) As Double
+    Dim attributeDefinition As AcadAttribute
+    
+    ReDim relativeVertices(0 To pointsCollection.Count * 2 - 1)
+    For i = 1 To pointsCollection.Count
+        blockNodeData = pointsCollection.Item(i)
+        relativeVertices((i - 1) * 2) = blockNodeData(1) - centroid(0)
+        relativeVertices((i - 1) * 2 + 1) = blockNodeData(2) - centroid(1)
+    Next i
+    
+    Set areaPolyline = blockDef.AddLightWeightPolyline(relativeVertices)
+    areaPolyline.Closed = True
+    areaPolyline.Lineweight = acLnWt025
+    
+    attributePoint(0) = 0#: attributePoint(1) = 5#: attributePoint(2) = 0#
+    Set attributeDefinition = blockDef.AddAttribute(AREA_ATTRIBUTE_TEXT_HEIGHT, acAttributeModeVerify, _
+                                                   "LABEL", attributePoint, "LABEL", areaLabel)
+End Sub
+
+Private Sub InsertAndConfigureAreaBlock(centroid() As Double, blockName As String, _
+                                      layerName As String, areaLabel As String)
+    Dim areaBlockReference As AcadBlockReference
+    
+    ThisDrawing.ActiveLayer = g_NodeTargetLayer
+    Set areaBlockReference = ThisDrawing.ModelSpace.InsertBlock(centroid, blockName, 1#, 1#, 1#, 0#)
+    areaBlockReference.layer = layerName
+    areaBlockReference.Update
+    
+    Call SetBlockAttribute(areaBlockReference, "LABEL", areaLabel, layerName)
+End Sub
+
+Private Sub SaveAreaRegionData(pointsCollection As Collection, centroid() As Double, _
+                             layerName As String, areaLabel As String, areaIndex As Long)
+    Dim areaRegionData As Variant
+    Dim calculatedArea As Double
+    Dim nodeLabelsString As String
+    Dim blockNodeData As Variant
+    Dim i As Long
+    
+    calculatedArea = CalculatePolygonArea(pointsCollection)
+    
+    nodeLabelsString = ""
+    For i = 1 To pointsCollection.Count
+        blockNodeData = pointsCollection.Item(i)
+        If i > 1 Then nodeLabelsString = nodeLabelsString & ", "
+        nodeLabelsString = nodeLabelsString & blockNodeData(0)
+    Next i
+    
+    ReDim areaRegionData(0 To 6)
+    areaRegionData(0) = areaLabel
+    areaRegionData(1) = Round(centroid(0), 3)
+    areaRegionData(2) = Round(centroid(1), 3)
+    areaRegionData(3) = pointsCollection.Count
+    areaRegionData(4) = layerName
+    areaRegionData(5) = nodeLabelsString
+    areaRegionData(6) = Round(calculatedArea, 3)
+    
+    g_AreaRegionDataCollection.Add areaRegionData
+    g_TotalAreasCreated = g_TotalAreasCreated + 1
+End Sub
+
+Private Function CalculatePolygonArea(pointsCollection As Collection) As Double
+    Dim area As Double
+    Dim i As Long, j As Long
+    Dim blockNodeData1 As Variant, blockNodeData2 As Variant
+    
+    area = 0#
+    For i = 1 To pointsCollection.Count
+        j = i Mod pointsCollection.Count + 1
+        blockNodeData1 = pointsCollection.Item(i)
+        blockNodeData2 = pointsCollection.Item(j)
+        area = area + (blockNodeData1(1) * blockNodeData2(2) - blockNodeData2(1) * blockNodeData1(2))
+    Next i
+    
+    CalculatePolygonArea = Abs(area) / 2#
+End Function
+
+Private Sub SetArrayToZero(ByRef targetArray() As Double)
+    targetArray(0) = 0#
+    targetArray(1) = 0#
+    targetArray(2) = 0#
+End Sub
